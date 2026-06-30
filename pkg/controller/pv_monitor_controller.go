@@ -18,7 +18,6 @@ package pv_monitor_controller
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -37,15 +36,17 @@ import (
 	"k8s.io/klog/v2"
 
 	handler "github.com/kubernetes-csi/external-health-monitor/pkg/csi-handler"
+	"github.com/kubernetes-csi/external-health-monitor/pkg/metrics"
 	"github.com/kubernetes-csi/external-health-monitor/pkg/util"
 )
 
 // PVMonitorController is the struct of pv monitor controller containing all information to perform volumes health condition checking
 type PVMonitorController struct {
-	client             kubernetes.Interface
-	driverName         string
-	eventRecorder      record.EventRecorder
-	supportListVolumes bool
+	client        kubernetes.Interface
+	driverName    string
+	eventRecorder record.EventRecorder
+
+	supportListVolumeHealth bool
 
 	pvChecker *handler.PVHealthConditionChecker
 
@@ -82,10 +83,11 @@ type PVMonitorController struct {
 
 // PVMonitorOptions configures PV monitor
 type PVMonitorOptions struct {
-	ContextTimeout    time.Duration
-	DriverName        string
-	EnableNodeWatcher bool
-	SupportListVolume bool
+	ContextTimeout          time.Duration
+	DriverName              string
+	EnableNodeWatcher       bool
+	SupportListVolumeHealth bool
+	SupportGetVolumeHealth  bool
 
 	ListVolumesInterval      time.Duration
 	PVWorkerExecuteInterval  time.Duration
@@ -102,16 +104,17 @@ func NewPVMonitorController(
 	conn *grpc.ClientConn,
 	factory informers.SharedInformerFactory,
 	eventRecorder record.EventRecorder,
+	healthMetrics *metrics.Metrics,
 	option *PVMonitorOptions,
 ) *PVMonitorController {
 	ctrl := &PVMonitorController{
-		csiConn:            conn,
-		eventRecorder:      eventRecorder,
-		supportListVolumes: option.SupportListVolume,
-		enableNodeWatcher:  option.EnableNodeWatcher,
-		client:             client,
-		driverName:         option.DriverName,
-		pvQueue:            workqueue.NewNamed("csi-monitor-pv-queue"),
+		csiConn:                 conn,
+		eventRecorder:           eventRecorder,
+		supportListVolumeHealth: option.SupportListVolumeHealth,
+		enableNodeWatcher:       option.EnableNodeWatcher,
+		client:                  client,
+		driverName:              option.DriverName,
+		pvQueue:                 workqueue.NewNamed("csi-monitor-pv-queue"),
 
 		pvcToPodsCache: util.NewPVCToPodsCache(),
 		pvEnqueued:     make(map[string]bool),
@@ -122,8 +125,7 @@ func NewPVMonitorController(
 	}
 	ctrl.setupPVInformer(factory)
 	ctrl.setupPVCInformer(factory)
-	ctrl.setupEventInformer(factory)
-	ctrl.setupPVChecker(factory, client, conn, option)
+	ctrl.setupPVChecker(factory, client, conn, healthMetrics, option)
 	ctrl.setupPodNodeInformersIfNecessary(factory, logger, option)
 	return ctrl
 }
@@ -145,25 +147,11 @@ func (ctrl *PVMonitorController) setupPVCInformer(factory informers.SharedInform
 	ctrl.pvcListerSynced = informer.Informer().HasSynced
 }
 
-func (ctrl *PVMonitorController) setupEventInformer(factory informers.SharedInformerFactory) {
-	informer := factory.Core().V1().Events()
-	informer.Informer().AddIndexers(cache.Indexers{
-		util.DefaultEventIndexerName: func(obj interface{}) ([]string, error) {
-			event := obj.(*v1.Event)
-			if event != nil {
-				key := fmt.Sprintf("%s:%s:%s", string(event.InvolvedObject.UID), event.Type, event.Reason)
-				return []string{key}, nil
-			} else {
-				return nil, nil
-			}
-		},
-	})
-}
-
 func (ctrl *PVMonitorController) setupPVChecker(
 	factory informers.SharedInformerFactory,
 	client kubernetes.Interface,
 	conn *grpc.ClientConn,
+	healthMetrics *metrics.Metrics,
 	option *PVMonitorOptions,
 ) {
 	ctrl.pvChecker = handler.NewPVHealthConditionChecker(
@@ -173,8 +161,8 @@ func (ctrl *PVMonitorController) setupPVChecker(
 		option.ContextTimeout,
 		ctrl.pvcLister,
 		ctrl.pvLister,
-		factory.Core().V1().Events(),
-		ctrl.eventRecorder,
+		option.SupportGetVolumeHealth,
+		healthMetrics,
 	)
 }
 
@@ -229,8 +217,8 @@ func (ctrl *PVMonitorController) Run(ctx context.Context, workers int, wg *sync.
 	}
 
 	// TODO: we need to cache the PVs info and get the diff so that we can identify the NotFound error
-	// if storage support List Volumes RPC, ListVolumes is preferred for performance reasons
-	if ctrl.supportListVolumes {
+	// if the driver supports ControllerListVolumeHealth, it is preferred for performance reasons
+	if ctrl.supportListVolumeHealth {
 		goTrack(wg, func() {
 			wait.UntilWithContext(ctx, ctrl.checkPVsHealthConditionByListVolumes, ctrl.ListVolumesInterval)
 		})
@@ -271,9 +259,9 @@ func waitForCacheSyncSucceed(ctx context.Context, ctrl *PVMonitorController) boo
 
 func (ctrl *PVMonitorController) checkPVsHealthConditionByListVolumes(ctx context.Context) {
 	logger := klog.FromContext(ctx)
-	err := ctrl.pvChecker.CheckControllerListVolumeStatuses(ctx)
+	err := ctrl.pvChecker.CheckControllerListVolumeHealth(ctx)
 	if err != nil {
-		logger.Error(err, "Check controller volume status error")
+		logger.Error(err, "Check controller volume health error")
 	}
 }
 
@@ -339,9 +327,9 @@ func (ctrl *PVMonitorController) checkPVWorker(ctx context.Context) {
 		return
 	}
 
-	err = ctrl.pvChecker.CheckControllerVolumeStatus(ctx, pv)
+	err = ctrl.pvChecker.CheckControllerVolumeHealth(ctx, pv)
 	if err != nil {
-		logger.Error(err, "Check controller volume status error")
+		logger.Error(err, "Check controller volume health error")
 	}
 
 	// re-enqueue anyway

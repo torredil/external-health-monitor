@@ -34,8 +34,6 @@ const (
 	DefaultKubeletPodsDirName         = "pods"
 	DefaultKubeletVolumesDirName      = "volumes"
 	DefaultKubeletBlockVolumesDirName = "volumeDevices"
-	DefaultEventIndexerName           = "event-uid"
-	DefaultRecoveryEventMessage       = "The Volume returns to the healthy state"
 )
 
 // MakeDeviceMountPath generates device mount path

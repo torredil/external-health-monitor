@@ -19,39 +19,55 @@ package csi_handler
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
-	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 
-	"github.com/kubernetes-csi/external-health-monitor/pkg/util"
+	"github.com/kubernetes-csi/external-health-monitor/pkg/apis/volumehealth"
+	"github.com/kubernetes-csi/external-health-monitor/pkg/metrics"
 )
 
-// PVHealthConditionChecker is for checking pv health condition
+// PVHealthConditionChecker probes controller-side volume health and reconciles it onto
+// pvc.status.healthStatus.
 type PVHealthConditionChecker struct {
 	driverName string
 
-	csiConn       *grpc.ClientConn
-	timeout       time.Duration
-	k8sClient     kubernetes.Interface
-	eventRecorder record.EventRecorder
+	timeout   time.Duration
+	k8sClient kubernetes.Interface
 
 	pvcLister corelisters.PersistentVolumeClaimLister
 	pvLister  corelisters.PersistentVolumeLister
 
-	eventInformer coreinformers.EventInformer
-
 	csiPVHandler CSIHandler
+
+	metrics *metrics.Metrics
+
+	// supportGetVolumeHealth lets the list recovery path confirm an absence with one Get
+	// call instead of waiting for a second empty cycle.
+	supportGetVolumeHealth bool
+
+	// recoveryStateMu guards the three recovery maps below, mutated from the GetVolume
+	// workers and the ListVolumes goroutine.
+	recoveryStateMu sync.Mutex
+	// knownUnhealthy tracks volume handles currently reported unhealthy; only these need
+	// clearing on recovery.
+	knownUnhealthy map[string]bool
+	// absentListCycles counts consecutive complete list cycles a volume has been absent.
+	absentListCycles map[string]int
+	// lastApplied is the per-PVC (namespace/name) no-op-suppression baseline.
+	//
+	// TODO: once pvc.Status.HealthStatus exists in k8s.io/api, read the
+	// baseline from the informer cache instead so suppression survives a restart.
+	lastApplied map[string][]volumehealth.VolumeHealthCondition
 }
 
-// NewPVHealthConditionChecker returns an instance of PVHealthConditionChecker
 func NewPVHealthConditionChecker(
 	name string,
 	conn *grpc.ClientConn,
@@ -59,28 +75,35 @@ func NewPVHealthConditionChecker(
 	timeout time.Duration,
 	pvcLister corelisters.PersistentVolumeClaimLister,
 	pvLister corelisters.PersistentVolumeLister,
-	eventInformer coreinformers.EventInformer,
-	recorder record.EventRecorder,
+	supportGetVolumeHealth bool,
+	healthMetrics *metrics.Metrics,
 ) *PVHealthConditionChecker {
 	return &PVHealthConditionChecker{
-		driverName:    name,
-		csiConn:       conn,
-		k8sClient:     kClient,
-		eventRecorder: recorder,
-		pvcLister:     pvcLister,
-		pvLister:      pvLister,
-		timeout:       timeout,
-		eventInformer: eventInformer,
-		csiPVHandler:  NewCSIPVHandler(conn),
+		driverName:             name,
+		k8sClient:              kClient,
+		pvcLister:              pvcLister,
+		pvLister:               pvLister,
+		timeout:                timeout,
+		supportGetVolumeHealth: supportGetVolumeHealth,
+		csiPVHandler:           NewCSIPVHandler(conn),
+		metrics:                healthMetrics,
+		knownUnhealthy:         map[string]bool{},
+		absentListCycles:       map[string]int{},
+		lastApplied:            map[string][]volumehealth.VolumeHealthCondition{},
 	}
 }
 
-// CheckControllerListVolumeStatuses checks volumes health condition by ListVolumes
-func (checker *PVHealthConditionChecker) CheckControllerListVolumeStatuses(ctx context.Context) error {
+// A previously-unhealthy volume absent from a complete list cycle is recovered via the
+// two-cycle rule, or a single Get confirmation when GET_VOLUME_HEALTH is supported.
+func (checker *PVHealthConditionChecker) CheckControllerListVolumeHealth(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, checker.timeout)
 	defer cancel()
 
-	result, err := checker.csiPVHandler.ControllerListVolumeConditions(ctx)
+	// A failed list RPC is not a recovery: leave stored conditions and absence counters
+	// untouched and try again next cycle.
+	start := time.Now()
+	result, err := checker.csiPVHandler.ControllerListVolumeHealth(ctx)
+	checker.observeProbe(metrics.MethodList, start, err)
 	if err != nil {
 		return err
 	}
@@ -93,12 +116,9 @@ func (checker *PVHealthConditionChecker) CheckControllerListVolumeStatuses(ctx c
 	logger := klog.FromContext(ctx)
 	for _, pv := range pvs {
 		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != checker.driverName {
-			logger.Info("CSI source is nil or the volume is not managed by this checker/monitor")
 			continue
 		}
-
 		if pv.Status.Phase != v1.VolumeBound {
-			logger.Info("PV status is not bound", "pv", pv.Name)
 			continue
 		}
 
@@ -108,30 +128,61 @@ func (checker *PVHealthConditionChecker) CheckControllerListVolumeStatuses(ctx c
 			continue
 		}
 
-		volumeCondition := result[volumeHandle]
-		if volumeCondition == nil {
-			continue
-		}
-
 		pvc, err := checker.pvcLister.PersistentVolumeClaims(pv.Spec.ClaimRef.Namespace).Get(pv.Spec.ClaimRef.Name)
 		if err != nil {
 			logger.Error(err, "Get PVC error")
 			continue
 		}
 
-		if volumeCondition.GetAbnormal() {
-			// Since pv status is bound, we believe PV controller, do not check pv.Spec.ClaimRef here.
-			checker.eventRecorder.Event(pvc, v1.EventTypeWarning, "VolumeConditionAbnormal", volumeCondition.GetMessage())
-		} else {
-			// Send recovery event if the abnormal event was sent and unexpired
-			checker.sendRecoveryEventToPVC(logger, pvc)
+		health, present := result[volumeHandle]
+		if present {
+			if err := checker.reconcileAndTrack(ctx, pvc, volumeHandle, health.Conditions); err != nil {
+				logger.Error(err, "Reconcile PVC health status error", "pvc", pvc.Name)
+			}
+			continue
+		}
+
+		if err := checker.handleAbsentInListCycle(ctx, pvc, volumeHandle); err != nil {
+			logger.Error(err, "Recover PVC health status error", "pvc", pvc.Name)
 		}
 	}
 
 	return nil
 }
 
-// GetVolumeHandle returns the volume handle of the pv
+// No-op unless the volume is currently believed unhealthy.
+func (checker *PVHealthConditionChecker) handleAbsentInListCycle(ctx context.Context, pvc *v1.PersistentVolumeClaim, volumeHandle string) error {
+	checker.recoveryStateMu.Lock()
+	unhealthy := checker.knownUnhealthy[volumeHandle]
+	checker.recoveryStateMu.Unlock()
+	if !unhealthy {
+		return nil
+	}
+
+	// With GET_VOLUME_HEALTH we can confirm recovery immediately with one authoritative call.
+	if checker.supportGetVolumeHealth {
+		start := time.Now()
+		health, err := checker.csiPVHandler.ControllerGetVolumeHealth(ctx, volumeHandle)
+		checker.observeProbe(metrics.MethodGet, start, err)
+		if err != nil {
+			// Failed RPC is not a recovery; wait for the next cycle.
+			return err
+		}
+		return checker.reconcileAndTrack(ctx, pvc, volumeHandle, health.Conditions)
+	}
+
+	// Otherwise require two consecutive complete cycles of absence before clearing.
+	checker.recoveryStateMu.Lock()
+	checker.absentListCycles[volumeHandle]++
+	absent := checker.absentListCycles[volumeHandle]
+	checker.recoveryStateMu.Unlock()
+
+	if absent >= 2 {
+		return checker.reconcileAndTrack(ctx, pvc, volumeHandle, nil)
+	}
+	return nil
+}
+
 func (checker *PVHealthConditionChecker) GetVolumeHandle(pv *v1.PersistentVolume) (string, error) {
 	if pv.Spec.CSI == nil {
 		return "", fmt.Errorf("csi source is nil")
@@ -140,8 +191,9 @@ func (checker *PVHealthConditionChecker) GetVolumeHandle(pv *v1.PersistentVolume
 	return pv.Spec.CSI.VolumeHandle, nil
 }
 
-// CheckControllerVolumeStatus checks volume status in controller side
-func (checker *PVHealthConditionChecker) CheckControllerVolumeStatus(ctx context.Context, pv *v1.PersistentVolume) error {
+// In Get mode an empty health report clears the stored conditions immediately (no two-cycle
+// wait — the Get RPC is authoritative).
+func (checker *PVHealthConditionChecker) CheckControllerVolumeHealth(ctx context.Context, pv *v1.PersistentVolume) error {
 	if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != checker.driverName {
 		return fmt.Errorf("csi source is nil or the volume is not managed by this checker/monitor")
 	}
@@ -164,8 +216,11 @@ func (checker *PVHealthConditionChecker) CheckControllerVolumeStatus(ctx context
 		return fmt.Errorf("volume handle in csi source is empty")
 	}
 
-	volumeCondition, err := checker.csiPVHandler.ControllerGetVolumeCondition(ctx, volumeHandle)
+	start := time.Now()
+	health, err := checker.csiPVHandler.ControllerGetVolumeHealth(ctx, volumeHandle)
+	checker.observeProbe(metrics.MethodGet, start, err)
 	if err != nil {
+		// Failed RPC is not a recovery.
 		return err
 	}
 
@@ -174,30 +229,62 @@ func (checker *PVHealthConditionChecker) CheckControllerVolumeStatus(ctx context
 		return err
 	}
 
-	// At the first stage, we just send PVC events
-	if volumeCondition.GetAbnormal() {
-		// Since pv status is bound, we believe PV controller, do not check pv.Spec.ClaimRef here.
-		checker.eventRecorder.Event(pvc, v1.EventTypeWarning, "VolumeConditionAbnormal", volumeCondition.GetMessage())
-	} else {
-		// Send recovery event if the abnormal event was sent and unexpired
-		checker.sendRecoveryEventToPVC(logger, pvc)
+	return checker.reconcileAndTrack(ctx, pvc, volumeHandle, health.Conditions)
+}
+
+// The driver's report is authoritative (overwrite, not merge), and a patch is issued only
+// when the set differs from the last-applied baseline, keeping the steady-state rate zero.
+func (checker *PVHealthConditionChecker) reconcileAndTrack(ctx context.Context, pvc *v1.PersistentVolumeClaim, volumeHandle string, conditions []volumehealth.VolumeHealthCondition) error {
+	pvcKey := pvc.Namespace + "/" + pvc.Name
+	desired := normalizeConditions(conditions)
+
+	checker.recoveryStateMu.Lock()
+	prev := checker.lastApplied[pvcKey]
+	checker.recoveryStateMu.Unlock()
+
+	if !conditionsEqual(prev, desired) {
+		if err := checker.patchPVCHealthStatus(ctx, pvc, buildHealthStatus(desired)); err != nil {
+			// Leave bookkeeping untouched so the next cycle retries the same transition.
+			return err
+		}
 	}
 
+	checker.recoveryStateMu.Lock()
+	defer checker.recoveryStateMu.Unlock()
+	if len(desired) > 0 {
+		checker.knownUnhealthy[volumeHandle] = true
+		checker.lastApplied[pvcKey] = desired
+	} else {
+		delete(checker.knownUnhealthy, volumeHandle)
+		delete(checker.lastApplied, pvcKey)
+	}
+	delete(checker.absentListCycles, volumeHandle)
+
+	checker.updateVolumeHealthGauge(pvc.Namespace, pvc.Name, desired)
 	return nil
 }
 
-// sendRecoveryEventToPVC sends the recovery event to the pvc
-// If the volume condition is normal and abnormal event wasn't expired,
-// PVHealthConditionChecker should send recovery event.
-func (checker *PVHealthConditionChecker) sendRecoveryEventToPVC(logger klog.Logger, pvc *v1.PersistentVolumeClaim) {
-	pvcUID := string(pvc.ObjectMeta.GetUID())
-	key := fmt.Sprintf("%s:%s:%s", pvcUID, v1.EventTypeWarning, "VolumeConditionAbnormal")
-	events, err := checker.eventInformer.Informer().GetIndexer().ByIndex(util.DefaultEventIndexerName, key)
-	if err != nil {
-		logger.Info("Get abnormal event from indexer failed", "err", err)
+// Safe when metrics is nil.
+func (checker *PVHealthConditionChecker) observeProbe(method string, start time.Time, err error) {
+	if checker.metrics == nil {
+		return
 	}
+	checker.metrics.ObserveProbe(method, time.Since(start).Seconds(), err)
+}
 
-	if len(events) > 0 {
-		checker.eventRecorder.Event(pvc, v1.EventTypeNormal, "VolumeConditionNormal", util.DefaultRecoveryEventMessage)
+// One gauge series per (status, reason) while unhealthy; all removed on recovery. Safe when
+// metrics is nil.
+func (checker *PVHealthConditionChecker) updateVolumeHealthGauge(namespace, name string, desired []volumehealth.VolumeHealthCondition) {
+	if checker.metrics == nil {
+		return
 	}
+	if len(desired) == 0 {
+		checker.metrics.ClearVolumeHealth(namespace, name)
+		return
+	}
+	pairs := make([][2]string, 0, len(desired))
+	for _, c := range desired {
+		pairs = append(pairs, [2]string{string(c.Status), c.Reason})
+	}
+	checker.metrics.SetVolumeHealth(namespace, name, pairs)
 }

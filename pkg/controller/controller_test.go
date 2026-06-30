@@ -7,249 +7,96 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/external-health-monitor/pkg/mock"
-	"github.com/kubernetes-csi/external-health-monitor/pkg/util"
 )
 
-func Test_AbnormalVolumeWithoutNodeWatcher(t *testing.T) {
-	abnormalVolume := &mock.MockVolume{
+func csiVolume(id string) *csi.Volume {
+	return &csi.Volume{VolumeId: id}
+}
+
+func abnormalMockVolume() *mock.MockVolume {
+	return &mock.MockVolume{
 		CSIVolume: &mock.CSIVolume{
-			Volume: &csi.Volume{
-				VolumeId: "abnormalVolume1",
-			},
-			Condition: &csi.VolumeCondition{
-				Abnormal: true,
-				Message:  "Volume not found",
-			},
+			Volume: csiVolume("abnormalVolume1"),
+			Health: mock.AbnormalVolumeHealth("abnormalVolume1"),
 		},
 		NativeVolume:      mock.CreatePV(2, "pvc", "pv", mock.DefaultNS, "abnormalVolume1", "pvcuid", &mock.FSVolumeMode, v1.VolumeBound),
 		NativeVolumeClaim: mock.CreatePVC(1, 2, "pvc", "pvcuid", mock.DefaultNS, "pv", v1.ClaimBound),
 	}
+}
 
-	testCase := &testCase{
-		name:               "abnormal_volume_case1",
-		enableNodeWatcher:  false,
-		supportListVolumes: true,
-		fakeNativeObjects: &fakeNativeObjects{
-			MockVolume: abnormalVolume,
+func healthyMockVolume() *mock.MockVolume {
+	return &mock.MockVolume{
+		CSIVolume: &mock.CSIVolume{
+			Volume: csiVolume("normalVolume1"),
+			Health: mock.HealthyVolumeHealth("normalVolume1"),
 		},
-		wantAbnormalEvent: true,
+		NativeVolume:      mock.CreatePV(2, "pvc", "pv", mock.DefaultNS, "normalVolume1", "pvcuid", &mock.FSVolumeMode, v1.VolumeBound),
+		NativeVolumeClaim: mock.CreatePVC(1, 2, "pvc", "pvcuid", mock.DefaultNS, "pv", v1.ClaimBound),
 	}
+}
 
-	runTest(t, testCase)
+func Test_AbnormalVolumeWithoutNodeWatcher(t *testing.T) {
+	runTest(t, &testCase{
+		name:                    "abnormal_volume_list",
+		enableNodeWatcher:       false,
+		supportListVolumeHealth: true,
+		fakeNativeObjects:       &fakeNativeObjects{MockVolume: abnormalMockVolume()},
+		wantAbnormalPatch:       true,
+	})
 }
 
 func Test_AbnormalVolumeWithNodeWatcher(t *testing.T) {
-	abnormalVolume := &mock.MockVolume{
-		CSIVolume: &mock.CSIVolume{
-			Volume: &csi.Volume{
-				VolumeId: "abnormalVolume1",
-			},
-			Condition: &csi.VolumeCondition{
-				Abnormal: true,
-				Message:  "Volume not found",
-			},
-		},
-		NativeVolume:      mock.CreatePV(2, "pvc", "pv", mock.DefaultNS, "abnormalVolume1", "pvcuid", &mock.FSVolumeMode, v1.VolumeBound),
-		NativeVolumeClaim: mock.CreatePVC(1, 2, "pvc", "pvcuid", mock.DefaultNS, "pv", v1.ClaimBound),
-	}
-
-	abnormalNodes := &mock.MockNode{
-		NativeNode: mock.CreateNode("node1", ""),
-	}
-
-	testCase := &testCase{
-		name:               "abnormal_volume_case1",
-		enableNodeWatcher:  true,
-		supportListVolumes: true,
+	runTest(t, &testCase{
+		name:                    "abnormal_volume_list_nodewatcher",
+		enableNodeWatcher:       true,
+		supportListVolumeHealth: true,
 		fakeNativeObjects: &fakeNativeObjects{
-			MockVolume: abnormalVolume,
-			MockNode:   abnormalNodes,
+			MockVolume: abnormalMockVolume(),
+			MockNode:   &mock.MockNode{NativeNode: mock.CreateNode("node1", "")},
 		},
-		wantAbnormalEvent: true,
-	}
-
-	runTest(t, testCase)
+		wantAbnormalPatch: true,
+	})
 }
 
 func Test_NormalVolumeWithoutNodeWatcher(t *testing.T) {
-	normalVolume := &mock.MockVolume{
-		CSIVolume: &mock.CSIVolume{
-			Volume: &csi.Volume{
-				VolumeId: "normalVolume1",
-			},
-			Condition: &csi.VolumeCondition{
-				Abnormal: false,
-				Message:  "",
-			},
-		},
-		NativeVolume:      mock.CreatePV(2, "pvc", "pv", mock.DefaultNS, "normalVolume1", "pvcuid", &mock.FSVolumeMode, v1.VolumeBound),
-		NativeVolumeClaim: mock.CreatePVC(1, 2, "pvc", "pvcuid", mock.DefaultNS, "pv", v1.ClaimBound),
-	}
-
-	testCase := &testCase{
-		name:               "normal_volume_case1",
-		enableNodeWatcher:  false,
-		supportListVolumes: true,
-		fakeNativeObjects: &fakeNativeObjects{
-			MockVolume: normalVolume,
-		},
-		wantAbnormalEvent: false,
-	}
-
-	runTest(t, testCase)
+	runTest(t, &testCase{
+		name:                    "normal_volume_list",
+		enableNodeWatcher:       false,
+		supportListVolumeHealth: true,
+		fakeNativeObjects:       &fakeNativeObjects{MockVolume: healthyMockVolume()},
+		wantAbnormalPatch:       false,
+	})
 }
 
-func Test_AbnormalVolumeWithoutNodeWatcherAndListVolume(t *testing.T) {
-	abnormalVolume := &mock.MockVolume{
-		CSIVolume: &mock.CSIVolume{
-			Volume: &csi.Volume{
-				VolumeId: "abnormalVolume1",
-			},
-			Condition: &csi.VolumeCondition{
-				Abnormal: true,
-				Message:  "Volume not found",
-			},
-		},
-		NativeVolume:      mock.CreatePV(2, "pvc", "pv", mock.DefaultNS, "abnormalVolume1", "pvcuid", &mock.FSVolumeMode, v1.VolumeBound),
-		NativeVolumeClaim: mock.CreatePVC(1, 2, "pvc", "pvcuid", mock.DefaultNS, "pv", v1.ClaimBound),
-	}
-
-	testCase := &testCase{
-		name:               "abnormal_volume_case1",
-		enableNodeWatcher:  false,
-		supportListVolumes: false,
-		fakeNativeObjects: &fakeNativeObjects{
-			MockVolume: abnormalVolume,
-		},
-		wantAbnormalEvent: true,
-	}
-
-	runTest(t, testCase)
+func Test_AbnormalVolumeWithoutNodeWatcherAndGetVolumeHealth(t *testing.T) {
+	runTest(t, &testCase{
+		name:                    "abnormal_volume_get",
+		enableNodeWatcher:       false,
+		supportListVolumeHealth: false,
+		fakeNativeObjects:       &fakeNativeObjects{MockVolume: abnormalMockVolume()},
+		wantAbnormalPatch:       true,
+	})
 }
 
-func Test_AbnormalVolumeWithNodeWatcherNoListVolume(t *testing.T) {
-	abnormalVolume := &mock.MockVolume{
-		CSIVolume: &mock.CSIVolume{
-			Volume: &csi.Volume{
-				VolumeId: "abnormalVolume1",
-			},
-			Condition: &csi.VolumeCondition{
-				Abnormal: true,
-				Message:  "Volume not found",
-			},
-		},
-		NativeVolume:      mock.CreatePV(2, "pvc", "pv", mock.DefaultNS, "abnormalVolume1", "pvcuid", &mock.FSVolumeMode, v1.VolumeBound),
-		NativeVolumeClaim: mock.CreatePVC(1, 2, "pvc", "pvcuid", mock.DefaultNS, "pv", v1.ClaimBound),
-	}
-
-	abnormalNodes := &mock.MockNode{
-		NativeNode: mock.CreateNode("node1", ""),
-	}
-
-	testCase := &testCase{
-		name:               "abnormal_volume_case1",
-		enableNodeWatcher:  true,
-		supportListVolumes: false,
+func Test_AbnormalVolumeWithNodeWatcherAndGetVolumeHealth(t *testing.T) {
+	runTest(t, &testCase{
+		name:                    "abnormal_volume_get_nodewatcher",
+		enableNodeWatcher:       true,
+		supportListVolumeHealth: false,
 		fakeNativeObjects: &fakeNativeObjects{
-			MockVolume: abnormalVolume,
-			MockNode:   abnormalNodes,
+			MockVolume: abnormalMockVolume(),
+			MockNode:   &mock.MockNode{NativeNode: mock.CreateNode("node1", "")},
 		},
-		wantAbnormalEvent: true,
-	}
-
-	runTest(t, testCase)
+		wantAbnormalPatch: true,
+	})
 }
 
-func Test_NormalVolumeWithoutNodeWatcherAndListVolume(t *testing.T) {
-	normalVolume := &mock.MockVolume{
-		CSIVolume: &mock.CSIVolume{
-			Volume: &csi.Volume{
-				VolumeId: "normalVolume1",
-			},
-			Condition: &csi.VolumeCondition{
-				Abnormal: false,
-				Message:  "",
-			},
-		},
-		NativeVolume:      mock.CreatePV(2, "pvc", "pv", mock.DefaultNS, "normalVolume1", "pvcuid", &mock.FSVolumeMode, v1.VolumeBound),
-		NativeVolumeClaim: mock.CreatePVC(1, 2, "pvc", "pvcuid", mock.DefaultNS, "pv", v1.ClaimBound),
-	}
-
-	testCase := &testCase{
-		name:               "normal_volume_case1",
-		enableNodeWatcher:  false,
-		supportListVolumes: false,
-		fakeNativeObjects: &fakeNativeObjects{
-			MockVolume: normalVolume,
-		},
-		wantAbnormalEvent: false,
-	}
-
-	runTest(t, testCase)
-}
-
-func Test_RecoveryEventWithListVolume(t *testing.T) {
-	normalVolume := &mock.MockVolume{
-		CSIVolume: &mock.CSIVolume{
-			Volume: &csi.Volume{
-				VolumeId: "normalVolume1",
-			},
-			Condition: &csi.VolumeCondition{
-				Abnormal: false,
-				Message:  util.DefaultRecoveryEventMessage,
-			},
-		},
-		NativeVolume:      mock.CreatePV(2, "pvc", "pv", mock.DefaultNS, "normalVolume1", "pvcuid", &mock.FSVolumeMode, v1.VolumeBound),
-		NativeVolumeClaim: mock.CreatePVC(1, 2, "pvc", "pvcuid", mock.DefaultNS, "pv", v1.ClaimBound),
-	}
-
-	oldAbnormalEvent := &mock.MockEvent{
-		NativeEvent: mock.CreateEvent("event", "", "pvcuid", v1.EventTypeWarning, "VolumeConditionAbnormal"),
-	}
-	testCase := &testCase{
-		name:               "normal_volume_recovery_event1",
-		enableNodeWatcher:  false,
-		supportListVolumes: true,
-		fakeNativeObjects: &fakeNativeObjects{
-			MockVolume: normalVolume,
-			MockEvent:  oldAbnormalEvent,
-		},
-		wantAbnormalEvent: false,
-		hasRecoveryEvent:  true,
-	}
-
-	runTest(t, testCase)
-}
-
-func Test_RecoveryEventWithoutListVolume(t *testing.T) {
-	normalVolume := &mock.MockVolume{
-		CSIVolume: &mock.CSIVolume{
-			Volume: &csi.Volume{
-				VolumeId: "normalVolume1",
-			},
-			Condition: &csi.VolumeCondition{
-				Abnormal: false,
-				Message:  util.DefaultRecoveryEventMessage,
-			},
-		},
-		NativeVolume:      mock.CreatePV(2, "pvc", "pv", mock.DefaultNS, "normalVolume1", "pvcuid", &mock.FSVolumeMode, v1.VolumeBound),
-		NativeVolumeClaim: mock.CreatePVC(1, 2, "pvc", "pvcuid", mock.DefaultNS, "pv", v1.ClaimBound),
-	}
-
-	oldAbnormalEvent := &mock.MockEvent{
-		NativeEvent: mock.CreateEvent("event", "", "pvcuid", v1.EventTypeWarning, "VolumeConditionAbnormal"),
-	}
-	testCase := &testCase{
-		name:               "normal_volume_recovery_event2",
-		enableNodeWatcher:  false,
-		supportListVolumes: false,
-		fakeNativeObjects: &fakeNativeObjects{
-			MockVolume: normalVolume,
-			MockEvent:  oldAbnormalEvent,
-		},
-		wantAbnormalEvent: false,
-		hasRecoveryEvent:  true,
-	}
-
-	runTest(t, testCase)
+func Test_NormalVolumeWithoutNodeWatcherAndGetVolumeHealth(t *testing.T) {
+	runTest(t, &testCase{
+		name:                    "normal_volume_get",
+		enableNodeWatcher:       false,
+		supportListVolumeHealth: false,
+		fakeNativeObjects:       &fakeNativeObjects{MockVolume: healthyMockVolume()},
+		wantAbnormalPatch:       false,
+	})
 }

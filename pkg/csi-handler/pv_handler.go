@@ -23,55 +23,45 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+
+	"github.com/kubernetes-csi/external-health-monitor/pkg/apis/volumehealth"
 )
 
 var _ CSIHandler = &csiPVHandler{}
 
 type csiPVHandler struct {
 	controllerClient csi.ControllerClient
-	nodeClient       csi.NodeClient
 }
 
 func NewCSIPVHandler(conn *grpc.ClientConn) CSIHandler {
 	return &csiPVHandler{
 		controllerClient: csi.NewControllerClient(conn),
-		nodeClient:       csi.NewNodeClient(conn),
 	}
 }
 
-type VolumeConditionResult struct {
-	abnormal bool
-	message  string
+type VolumeHealthResult struct {
+	Conditions []volumehealth.VolumeHealthCondition
 }
 
-func (vcr *VolumeConditionResult) GetAbnormal() bool {
-	return vcr.abnormal
-}
-
-func (vcr *VolumeConditionResult) GetMessage() string {
-	return vcr.message
-}
-
-func (handler *csiPVHandler) ControllerListVolumeConditions(ctx context.Context) (map[string]*VolumeConditionResult, error) {
-	p := map[string]*VolumeConditionResult{}
+// A volume absent from the returned map was not reported in this list cycle (distinct from
+// present-but-empty, which means healthy); the caller's two-cycle recovery logic handles it.
+func (handler *csiPVHandler) ControllerListVolumeHealth(ctx context.Context) (map[string]*VolumeHealthResult, error) {
+	p := map[string]*VolumeHealthResult{}
 
 	token := ""
 	for {
-		rsp, err := handler.controllerClient.ListVolumes(ctx, &csi.ListVolumesRequest{
+		rsp, err := handler.controllerClient.ControllerListVolumeHealth(ctx, &csi.ControllerListVolumeHealthRequest{
 			StartingToken: token,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to list volumes: %v", err)
+			return nil, fmt.Errorf("failed to list volume health: %v", err)
 		}
 
-		for _, e := range rsp.Entries {
-			p[e.GetVolume().VolumeId] = &VolumeConditionResult{
-				abnormal: e.GetStatus().GetVolumeCondition().GetAbnormal(),
-				message:  e.GetStatus().GetVolumeCondition().GetMessage(),
-			}
+		for _, vh := range rsp.GetEntries() {
+			p[vh.GetVolumeId()] = volumeHealthToResult(vh)
 		}
-		token = rsp.NextToken
 
+		token = rsp.GetNextToken()
 		if len(token) == 0 {
 			break
 		}
@@ -79,37 +69,47 @@ func (handler *csiPVHandler) ControllerListVolumeConditions(ctx context.Context)
 	return p, nil
 }
 
-func (handler *csiPVHandler) ControllerGetVolumeCondition(ctx context.Context, volumeID string) (*VolumeConditionResult, error) {
-	req := csi.ControllerGetVolumeRequest{
+// A non-error response with no health statuses is the explicit recovery signal and yields
+// an empty (healthy) result.
+func (handler *csiPVHandler) ControllerGetVolumeHealth(ctx context.Context, volumeID string) (*VolumeHealthResult, error) {
+	res, err := handler.controllerClient.ControllerGetVolumeHealth(ctx, &csi.ControllerGetVolumeHealthRequest{
 		VolumeId: volumeID,
-	}
-
-	res, err := handler.controllerClient.ControllerGetVolume(ctx, &req)
+	})
 	if err != nil {
-		// if there is an error, do not return abnormal status
-		// wait for another call
+		// A failed RPC is not a recovery; let the caller leave stored conditions in place.
 		return nil, err
 	}
 
-	// We reach here only when VOLUME_CONDITION controller capability is supported
-	// so the Status in ControllerGetVolumeResponse must not be nil
-
-	return &VolumeConditionResult{abnormal: res.GetStatus().GetVolumeCondition().GetAbnormal(), message: res.GetStatus().GetVolumeCondition().GetMessage()}, nil
+	return volumeHealthToResult(res.GetVolumeHealth()), nil
 }
 
-func (handler *csiPVHandler) NodeGetVolumeCondition(ctx context.Context, volumeID string, volumePath string, volumeStagingPath string) (*VolumeConditionResult, error) {
-	req := csi.NodeGetVolumeStatsRequest{
-		VolumeId:          volumeID,
-		VolumePath:        volumePath,
-		StagingTargetPath: volumeStagingPath,
+func volumeHealthToResult(vh *csi.VolumeHealth) *VolumeHealthResult {
+	result := &VolumeHealthResult{}
+	if vh == nil {
+		return result
 	}
-
-	res, err := handler.nodeClient.NodeGetVolumeStats(ctx, &req)
-	if err != nil {
-		// if there is an error, do not return abnormal status
-		// wait for another call
-		return nil, err
+	for _, entry := range vh.GetHealthStatuses() {
+		if entry == nil {
+			continue
+		}
+		result.Conditions = append(result.Conditions, volumehealth.VolumeHealthCondition{
+			Status:  mapVolumeHealthErrorType(entry.GetStatus()),
+			Reason:  entry.GetReason(),
+			Message: entry.GetMessage(),
+		})
 	}
+	return result
+}
 
-	return &VolumeConditionResult{abnormal: res.GetVolumeCondition().GetAbnormal(), message: res.GetVolumeCondition().GetMessage()}, nil
+func mapVolumeHealthErrorType(t csi.VolumeHealthErrorType) volumehealth.VolumeHealthStatusType {
+	switch t {
+	case csi.VolumeHealthErrorType_INACCESSIBLE:
+		return volumehealth.VolumeHealthInaccessible
+	case csi.VolumeHealthErrorType_DATA_LOSS:
+		return volumehealth.VolumeHealthDataLoss
+	case csi.VolumeHealthErrorType_DEGRADED:
+		return volumehealth.VolumeHealthDegraded
+	default:
+		return volumehealth.VolumeHealthDegraded
+	}
 }

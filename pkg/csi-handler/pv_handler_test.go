@@ -8,10 +8,10 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
 	"github.com/kubernetes-csi/csi-test/v5/utils"
+	"github.com/kubernetes-csi/external-health-monitor/pkg/apis/volumehealth"
 	"github.com/kubernetes-csi/external-health-monitor/pkg/mock"
 )
 
-// Test Data
 var (
 	volume1 = &csi.Volume{
 		VolumeId: "1",
@@ -21,34 +21,48 @@ var (
 		VolumeId: "2",
 	}
 
-	abnormalVolumeCondition = &csi.VolumeCondition{
-		Abnormal: true,
-		Message:  "Volume not found",
+	abnormalVolumeHealth = &csi.VolumeHealth{
+		VolumeId: "1",
+		HealthStatuses: []*csi.VolumeHealth_VolumeHealthEntry{
+			{
+				Status:  csi.VolumeHealthErrorType_INACCESSIBLE,
+				Reason:  "VolumeNotFound",
+				Message: "Volume not found",
+			},
+		},
 	}
 
-	normalVolumeCondition = &csi.VolumeCondition{
-		Abnormal: false,
-		Message:  "",
+	healthyVolumeHealth = &csi.VolumeHealth{
+		VolumeId:       "2",
+		HealthStatuses: nil,
 	}
 
 	volumeMap = map[string]VolumeSample{
 		"1": {
-			Volume:    volume1,
-			Condition: abnormalVolumeCondition,
+			Volume: volume1,
+			Health: abnormalVolumeHealth,
 		},
 		"2": {
-			Volume:    volume2,
-			Condition: normalVolumeCondition,
+			Volume: volume2,
+			Health: healthyVolumeHealth,
+		},
+	}
+
+	abnormalConditions = []volumehealth.VolumeHealthCondition{
+		{
+			Status:  volumehealth.VolumeHealthInaccessible,
+			Reason:  "VolumeNotFound",
+			Message: "Volume not found",
 		},
 	}
 )
 
 type VolumeSample struct {
-	Volume    *csi.Volume
-	Condition *csi.VolumeCondition
+	Volume *csi.Volume
+	Health *csi.VolumeHealth
 }
 
-func Test_csiPVHandler_ControllerListVolumeConditions(t *testing.T) {
+func Test_csiPVHandler_ControllerListVolumeHealth(t *testing.T) {
 	mockController, driver, _, controllerServer, _, csiConn, err := mock.CreateMockServer(t)
 	if err != nil {
 		t.Fatal(err)
@@ -57,62 +71,46 @@ func Test_csiPVHandler_ControllerListVolumeConditions(t *testing.T) {
 	defer driver.Stop()
 
 	handler := NewCSIPVHandler(csiConn)
-	in := &csi.ListVolumesRequest{
+	in := &csi.ControllerListVolumeHealthRequest{
 		StartingToken: "",
 	}
-	out := &csi.ListVolumesResponse{
-		Entries: []*csi.ListVolumesResponse_Entry{
-			{
-				Volume: volume1,
-				Status: &csi.ListVolumesResponse_VolumeStatus{
-					VolumeCondition: abnormalVolumeCondition,
-				},
-			},
-			{
-				Volume: volume2,
-				Status: &csi.ListVolumesResponse_VolumeStatus{
-					VolumeCondition: normalVolumeCondition,
-				},
-			},
+	out := &csi.ControllerListVolumeHealthResponse{
+		Entries: []*csi.VolumeHealth{
+			abnormalVolumeHealth,
+			healthyVolumeHealth,
 		},
 		NextToken: "",
 	}
 
-	controllerServer.EXPECT().ListVolumes(gomock.Any(), utils.Protobuf(in)).Return(out, nil).Times(1)
+	controllerServer.EXPECT().ControllerListVolumeHealth(gomock.Any(), utils.Protobuf(in)).Return(out, nil).Times(1)
 	tests := []struct {
 		name    string
-		want    map[string]*VolumeConditionResult
+		want    map[string]*VolumeHealthResult
 		wantErr bool
 	}{
 		{
 			name: "case1",
-			want: map[string]*VolumeConditionResult{
-				"1": {
-					abnormal: true,
-					message:  "Volume not found",
-				},
-				"2": {
-					abnormal: false,
-					message:  "",
-				},
+			want: map[string]*VolumeHealthResult{
+				"1": {Conditions: abnormalConditions},
+				"2": {Conditions: nil},
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := handler.ControllerListVolumeConditions(context.Background())
+			got, err := handler.ControllerListVolumeHealth(context.Background())
 			if (err != nil) != tt.wantErr {
-				t.Errorf("csiPVHandler.ControllerListVolumeConditions() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("csiPVHandler.ControllerListVolumeHealth() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("csiPVHandler.ControllerListVolumeConditions() = %v, want %v", got, tt.want)
+				t.Errorf("csiPVHandler.ControllerListVolumeHealth() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func Test_csiPVHandler_ControllerGetVolumeCondition(t *testing.T) {
+func Test_csiPVHandler_ControllerGetVolumeHealth(t *testing.T) {
 	mockController, driver, _, controllerServer, _, csiConn, err := mock.CreateMockServer(t)
 	if err != nil {
 		t.Fatal(err)
@@ -123,121 +121,60 @@ func Test_csiPVHandler_ControllerGetVolumeCondition(t *testing.T) {
 	handler := NewCSIPVHandler(csiConn)
 	tests := []struct {
 		name     string
-		want     *VolumeConditionResult
+		want     *VolumeHealthResult
 		volumeId string
 		wantErr  bool
 	}{
 		{
 			name:     "AbnormalCase",
 			volumeId: "1",
-			want: &VolumeConditionResult{
-				abnormal: true,
-				message:  "Volume not found",
-			},
-			wantErr: false,
+			want:     &VolumeHealthResult{Conditions: abnormalConditions},
+			wantErr:  false,
 		},
 		{
-			name:     "NormalCase",
+			name:     "HealthyCase",
 			volumeId: "2",
-			want: &VolumeConditionResult{
-				abnormal: false,
-				message:  "",
-			},
-			wantErr: false,
+			want:     &VolumeHealthResult{Conditions: nil},
+			wantErr:  false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			in := &csi.ControllerGetVolumeRequest{
+			in := &csi.ControllerGetVolumeHealthRequest{
 				VolumeId: tt.volumeId,
 			}
-			out := &csi.ControllerGetVolumeResponse{
-				Volume: volumeMap[tt.volumeId].Volume,
-				Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-					VolumeCondition: volumeMap[tt.volumeId].Condition,
-				},
+			out := &csi.ControllerGetVolumeHealthResponse{
+				VolumeHealth: volumeMap[tt.volumeId].Health,
 			}
-			controllerServer.EXPECT().ControllerGetVolume(gomock.Any(), utils.Protobuf(in)).Return(out, nil).Times(1)
-			got, err := handler.ControllerGetVolumeCondition(context.Background(), tt.volumeId)
+			controllerServer.EXPECT().ControllerGetVolumeHealth(gomock.Any(), utils.Protobuf(in)).Return(out, nil).Times(1)
+			got, err := handler.ControllerGetVolumeHealth(context.Background(), tt.volumeId)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("csiPVHandler.ControllerGetVolumeCondition() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("csiPVHandler.ControllerGetVolumeHealth() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("csiPVHandler.ControllerGetVolumeCondition() = %v, want %v", got, tt.want)
+				t.Errorf("csiPVHandler.ControllerGetVolumeHealth() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func Test_csiPVHandler_NodeGetVolumeCondition(t *testing.T) {
-	mockController, driver, _, _, nodeServer, csiConn, err := mock.CreateMockServer(t)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mockController.Finish()
-	defer driver.Stop()
-
-	handler := NewCSIPVHandler(csiConn)
-	type args struct {
-		volumeID          string
-		volumePath        string
-		volumeStagingPath string
-		ctx               context.Context
-	}
+func Test_mapVolumeHealthErrorType(t *testing.T) {
 	tests := []struct {
-		name    string
-		want    *VolumeConditionResult
-		wantErr bool
-		args    args
+		name string
+		in   csi.VolumeHealthErrorType
+		want volumehealth.VolumeHealthStatusType
 	}{
-		{
-			name: "AbnormalCase",
-			want: &VolumeConditionResult{
-				abnormal: true,
-				message:  "Volume not found",
-			},
-			args: args{
-				volumeID:          "1",
-				volumePath:        "",
-				volumeStagingPath: "",
-				ctx:               context.Background(),
-			},
-			wantErr: false,
-		},
-		{
-			name: "NormalCase",
-			want: &VolumeConditionResult{
-				abnormal: false,
-				message:  "",
-			},
-			args: args{
-				volumeID:          "2",
-				volumePath:        "",
-				volumeStagingPath: "",
-				ctx:               context.Background(),
-			},
-			wantErr: false,
-		},
+		{"inaccessible", csi.VolumeHealthErrorType_INACCESSIBLE, volumehealth.VolumeHealthInaccessible},
+		{"dataloss", csi.VolumeHealthErrorType_DATA_LOSS, volumehealth.VolumeHealthDataLoss},
+		{"degraded", csi.VolumeHealthErrorType_DEGRADED, volumehealth.VolumeHealthDegraded},
+		// Unknown / future enum values must not be treated as healthy; they surface as Degraded.
+		{"unknown", csi.VolumeHealthErrorType_UNKNOWN_VOLUME_HEALTH_TYPE, volumehealth.VolumeHealthDegraded},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			in := &csi.NodeGetVolumeStatsRequest{
-				VolumeId:          tt.args.volumeID,
-				VolumePath:        "",
-				StagingTargetPath: "",
-			}
-			out := &csi.NodeGetVolumeStatsResponse{
-				VolumeCondition: volumeMap[tt.args.volumeID].Condition,
-			}
-			nodeServer.EXPECT().NodeGetVolumeStats(gomock.Any(), utils.Protobuf(in)).Return(out, nil).Times(1)
-			got, err := handler.NodeGetVolumeCondition(tt.args.ctx, tt.args.volumeID, tt.args.volumePath, tt.args.volumeStagingPath)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("csiPVHandler.NodeGetVolumeCondition() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("csiPVHandler.NodeGetVolumeCondition() = %v, want %v", got, tt.want)
+			if got := mapVolumeHealthErrorType(tt.in); got != tt.want {
+				t.Errorf("mapVolumeHealthErrorType(%v) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
 	}

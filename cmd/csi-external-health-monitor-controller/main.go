@@ -50,6 +50,7 @@ import (
 
 	monitorcontroller "github.com/kubernetes-csi/external-health-monitor/pkg/controller"
 	"github.com/kubernetes-csi/external-health-monitor/pkg/features"
+	healthmetrics "github.com/kubernetes-csi/external-health-monitor/pkg/metrics"
 )
 
 const (
@@ -153,6 +154,9 @@ func main() {
 	logger.V(2).Info("CSI driver name", "driver", storageDriver)
 	metricsManager.SetDriverName(storageDriver)
 
+	healthMetrics := healthmetrics.New()
+	healthMetrics.Register(metricsManager.GetRegistry())
+
 	// Prepare HTTP endpoint for metrics + leader election healthz
 	mux := http.NewServeMux()
 	if addr != "" {
@@ -177,34 +181,29 @@ func main() {
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
-	supportControllerListVolumes, err := supportControllerListVolumes(cancelationCtx, csiConn)
+	supportListVolumeHealth, err := supportsControllerCapability(cancelationCtx, csiConn, csi.ControllerServiceCapability_RPC_LIST_VOLUME_HEALTH)
 	if err != nil {
-		logger.Error(err, "Failed to check whether the CSI driver supports the Controller Service ListVolumes")
+		logger.Error(err, "Failed to check whether the CSI driver supports ControllerListVolumeHealth")
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
-	supportControllerGetVolume, err := supportControllerGetVolume(cancelationCtx, csiConn)
+	supportGetVolumeHealth, err := supportsControllerCapability(cancelationCtx, csiConn, csi.ControllerServiceCapability_RPC_GET_VOLUME_HEALTH)
 	if err != nil {
-		logger.Error(err, "Failed to check whether the CSI driver supports the Controller Service GetVolume")
+		logger.Error(err, "Failed to check whether the CSI driver supports ControllerGetVolumeHealth")
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
-	supportControllerVolumeCondition, err := supportControllerVolumeCondition(cancelationCtx, csiConn)
-	if err != nil {
-		logger.Error(err, "Failed to check whether the CSI driver supports the Controller Service VolumeCondition")
-		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
-	}
-
-	if (!supportControllerListVolumes && !supportControllerGetVolume) || !supportControllerVolumeCondition {
-		logger.V(2).Info("CSI driver does not support Controller ListVolumes and GetVolume service or does not implement VolumeCondition, exiting")
+	if !supportListVolumeHealth && !supportGetVolumeHealth {
+		logger.V(2).Info("CSI driver supports neither ControllerListVolumeHealth nor ControllerGetVolumeHealth, exiting")
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	option := monitorcontroller.PVMonitorOptions{
-		DriverName:        storageDriver,
-		ContextTimeout:    *timeout,
-		EnableNodeWatcher: *enableNodeWatcher,
-		SupportListVolume: supportControllerListVolumes,
+		DriverName:              storageDriver,
+		ContextTimeout:          *timeout,
+		EnableNodeWatcher:       *enableNodeWatcher,
+		SupportListVolumeHealth: supportListVolumeHealth,
+		SupportGetVolumeHealth:  supportGetVolumeHealth,
 
 		ListVolumesInterval:      *listVolumesInterval,
 		PVWorkerExecuteInterval:  *monitorInterval,
@@ -224,6 +223,7 @@ func main() {
 		csiConn,
 		factory,
 		eventRecorder,
+		healthMetrics,
 		&option,
 	)
 
@@ -275,66 +275,13 @@ func main() {
 	)
 }
 
-func supportControllerListVolumes(ctx context.Context, csiConn *grpc.ClientConn) (supportControllerListVolumes bool, err error) {
+func supportsControllerCapability(ctx context.Context, csiConn *grpc.ClientConn, capability csi.ControllerServiceCapability_RPC_Type) (bool, error) {
 	caps, err := rpc.GetControllerCapabilities(ctx, csiConn)
 	if err != nil {
 		return false, fmt.Errorf("failed to get controller capabilities: %v", err)
 	}
 
-	return caps[csi.ControllerServiceCapability_RPC_LIST_VOLUMES], nil
-}
-
-// TODO: move this to csi-lib-utils
-func supportControllerGetVolume(ctx context.Context, csiConn *grpc.ClientConn) (supportControllerGetVolume bool, err error) {
-	client := csi.NewControllerClient(csiConn)
-	req := csi.ControllerGetCapabilitiesRequest{}
-	rsp, err := client.ControllerGetCapabilities(ctx, &req)
-	if err != nil {
-		return false, err
-	}
-
-	for _, cap := range rsp.GetCapabilities() {
-		if cap == nil {
-			continue
-		}
-		rpc := cap.GetRpc()
-		if rpc == nil {
-			continue
-		}
-		t := rpc.GetType()
-		if t == csi.ControllerServiceCapability_RPC_GET_VOLUME {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-// TODO: move this to csi-lib-utils
-func supportControllerVolumeCondition(ctx context.Context, csiConn *grpc.ClientConn) (supportControllerVolumeCondition bool, err error) {
-	client := csi.NewControllerClient(csiConn)
-	req := csi.ControllerGetCapabilitiesRequest{}
-	rsp, err := client.ControllerGetCapabilities(ctx, &req)
-	if err != nil {
-		return false, err
-	}
-
-	for _, cap := range rsp.GetCapabilities() {
-		if cap == nil {
-			continue
-		}
-
-		rpc := cap.GetRpc()
-		if rpc == nil {
-			continue
-		}
-		t := rpc.GetType()
-		if t == csi.ControllerServiceCapability_RPC_VOLUME_CONDITION {
-			return true, nil
-		}
-	}
-
-	return false, nil
+	return caps[capability], nil
 }
 
 // TODO: move this to csi-lib-utils

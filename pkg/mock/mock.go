@@ -30,15 +30,33 @@ var (
 	DriverName         = "fake.csi.driver.io"
 	DefaultKubeletPath = "/var/lib/kubelet"
 	FSVolumeMode       = v1.PersistentVolumeBlock
-	AbnormalEvent      = "Warning VolumeConditionAbnormal Volume not found"
-	NormalEvent        = "Normal VolumeConditionNormal The Volume returns to the healthy state"
 	ErrorWatchTimeout  = errors.New("watch event timeout")
 )
 
 type CSIVolume struct {
-	Volume    *csi.Volume
-	Condition *csi.VolumeCondition
-	IsBlock   bool
+	Volume  *csi.Volume
+	Health  *csi.VolumeHealth
+	IsBlock bool
+}
+
+func AbnormalVolumeHealth(volumeID string) *csi.VolumeHealth {
+	return &csi.VolumeHealth{
+		VolumeId: volumeID,
+		HealthStatuses: []*csi.VolumeHealth_VolumeHealthEntry{
+			{
+				Status:  csi.VolumeHealthErrorType_INACCESSIBLE,
+				Reason:  "VolumeNotFound",
+				Message: "Volume not found",
+			},
+		},
+	}
+}
+
+func HealthyVolumeHealth(volumeID string) *csi.VolumeHealth {
+	return &csi.VolumeHealth{
+		VolumeId:       volumeID,
+		HealthStatuses: nil,
+	}
 }
 
 type MockNode struct {
