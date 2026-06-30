@@ -254,12 +254,13 @@ func main() {
 	run := func(ctx context.Context) {
 		if utilfeature.DefaultFeatureGate.Enabled(features.ReleaseLeaderElectionOnExit) {
 			var wg sync.WaitGroup
-			stopCh := controllerCtx.Done()
-			factory.Start(stopCh)
+			factory.Start(ctx.Done())
 			monitorController.Run(controllerCtx, int(*workerThreads), &wg)
+			<-controllerCtx.Done()
+			wg.Wait()
+			terminate()
 		} else {
-			stopCh := ctx.Done()
-			factory.Start(stopCh)
+			factory.Start(ctx.Done())
 			monitorController.Run(ctx, int(*workerThreads), nil)
 		}
 	}
